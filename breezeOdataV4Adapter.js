@@ -63,7 +63,7 @@
                     // OData can return data['@odata.count'] as a string
                     inlineCount = parseInt(data['@odata.count'], 10);
                 }
-                return deferred.resolve({ results: data.value, inlineCount: inlineCount, httpResponse: response });
+                return deferred.resolve({ result: data, inlineCount: inlineCount, httpResponse: response });
             },
             function (error) {
                 return deferred.reject(createError(error, url));
@@ -72,6 +72,16 @@
         return deferred.promise;
     };
 
+    // array functions
+    function __toArray(item) {
+        if (item == null) {
+            return [];
+        } else if (Array.isArray(item)) {
+            return item;
+        } else {
+            return [item];
+        }
+    }
 
     proto.fetchMetadata = function (metadataStore, dataService) {
 
@@ -80,9 +90,9 @@
         var serviceName = dataService.serviceName;
         var url = dataService.qualifyUrl('$metadata');
         // OData.read(url,
-        odatajs.read({
+        odatajs.oData.read({
                 requestUri: url,
-                // headers: { "Accept": "application/json"}
+                //headers: { "Accept": "application/json"}
                 headers: { Accept: 'application/json;odata.metadata=full' }
             },
             function (data) {
@@ -93,9 +103,25 @@
                     return deferred.reject(error);
                 }
                 var csdlMetadata = data.dataServices;
-
+                
                 // might have been fetched by another query
                 if (!metadataStore.hasMetadataFor(serviceName)) {
+                    //hack: metadata
+                    __toArray(csdlMetadata.schema).forEach(function (sh) {
+                        if (sh.entityType) {
+                            __toArray(sh.entityType).forEach(function (et) {
+                                if (et.key)
+                                {
+                                    //limit EntityKey key to one
+                                    if (et.key.length > 1)
+                                        return deferred.reject(new Error("Metadata EntityType " + et.name + "; Multiple keys not supported."));
+
+                                    et.key = et.key[0]; 
+                                }
+                            });
+                        }
+                    });
+
                     try {
                         metadataStore.importMetadata(csdlMetadata);
                     } catch (e) {
@@ -112,91 +138,186 @@
                 err.message = "Metadata query failed for: " + url + "; " + (err.message || "");
                 return deferred.reject(err);
             },
-            odatajs.metadataHandler
+            odatajs.oData.metadataHandler
         );
 
         return deferred.promise;
 
     };
 
-    proto.getRoutePrefix = function (/*dataService*/) {
-        return '';
+    proto.getRoutePrefix = function (dataService) {
+        return dataService.serviceName;
     } // see webApiODataCtor
 
     proto.saveChanges = function (saveContext, saveBundle) {
         var adapter = saveContext.adapter = this;
-        var deferred = Q.defer();
+        var batched = true; //todo setting for batch support
+        
         saveContext.routePrefix = adapter.getRoutePrefix(saveContext.dataService);
-        var url = saveContext.dataService.qualifyUrl("$batch");
-
+        
+        //var batch = createBoundary("batch_");
         var requestData = createChangeRequests(saveContext, saveBundle);
         var tempKeys = saveContext.tempKeys;
         var contentKeys = saveContext.contentKeys;
 
-        odatajs.oData.request({
-            headers: {
-                "OData-Version": "4.0",
-                "Content-Type": "multipart/mixed;boundary=" + createBoundary("batch_")
-            },
-            requestUri: url,
-            method: "POST",
-            data: requestData
-        }, function (data, response) {
-            var entities = [];
-            var keyMappings = [];
-            var saveResult = { entities: entities, keyMappings: keyMappings };
-            data.__batchResponses.forEach(function (br) {
-                br.__changeResponses.forEach(function (cr, index) {
-                    var response = cr.response || cr;
-                    var statusCode = response.statusCode;
-                    if ((!statusCode) || statusCode >= 400) {
-                        deferred.reject(createError(cr, url));
-                        return;
-                    }
+        //check for actual changes
+        //maybe insert flag direct in createChangeRequests
+        var changeCount = 0;
+        requestData.__batchRequests.forEach(function (breq) {
+            changeCount += breq.__changeRequests.length;
+        });
+        if (changeCount == 0) {
+            //todo debug log info
+            //maybe check entity state
+            var saveResult = { entities: [], keyMappings: keyMappings };
+            return Q.when(saveResult);
+        } else if (changeCount == 1)
+            batched = false;
+        
+        if (batched)
+        {
+            var url = saveContext.dataService.qualifyUrl("$batch");
 
-                    /**
-                     * It seems that the `Content-ID` header is not being properly parsed out by the odatajs library. As a work around
-                     * we can assume that each change response is numbered sequentially from 1, and infer the ID from the index in the
-                     * br.__changeResponses array.
-                     */
-                    //var contentId = cr.headers["Content-ID"];
-                    var contentId = index + 1;
+            var deferred = Q.defer();
 
-                    var rawEntity = cr.data;
-                    if (rawEntity) {
-                        var tempKey = tempKeys[contentId];
-                        if (tempKey) {
-                            var entityType = tempKey.entityType;
-                            if (entityType.autoGeneratedKeyType !== AutoGeneratedKeyType.None) {
-                                var tempValue = tempKey.values[0];
-                                var realKey = entityType.getEntityKeyFromRawEntity(rawEntity, DataProperty.getRawValueFromServer);
-                                var keyMapping = { entityTypeName: entityType.name, tempValue: tempValue, realValue: realKey.values[0] };
-                                keyMappings.push(keyMapping);
-                            }
+            odatajs.oData.request({
+                headers: {
+                    "OData-Version": "4.0",
+                    //"Content-Type": "multipart/mixed; boundary=" + batch
+                },
+                requestUri: url,
+                method: "POST",
+                data: requestData
+            }, function (data, response) {
+                var entities = [];
+                var keyMappings = [];
+                var saveResult = { entities: entities, keyMappings: keyMappings };
+                data.__batchResponses.forEach(function (br) {
+                    br.__changeResponses.forEach(function (cr, index) {
+                        var response = cr.response || cr;
+                        var statusCode = response.statusCode;
+                        if ((!statusCode) || statusCode >= 400) {
+                            deferred.reject(createError(cr, url));
+                            return;
                         }
-                        entities.push(rawEntity);
-                    } else {
-                        var origEntity = contentKeys[contentId];
-                        entities.push(origEntity);
-                    }
+
+                        /**
+                         * It seems that the `Content-ID` header is not being properly parsed out by the odatajs library. As a work around
+                         * we can assume that each change response is numbered sequentially from 1, and infer the ID from the index in the
+                         * br.__changeResponses array.
+                         */
+                        //var contentId = cr.headers["Content-ID"];
+                        var contentId = index + 1;
+
+                        var rawEntity = cr.data;
+                        if (rawEntity) {
+                            var tempKey = tempKeys[contentId];
+                            if (tempKey) {
+                                var entityType = tempKey.entityType;
+                                if (entityType.autoGeneratedKeyType !== AutoGeneratedKeyType.None) {
+                                    var tempValue = tempKey.values[0];
+                                    var realKey = entityType.getEntityKeyFromRawEntity(rawEntity, DataProperty.getRawValueFromServer);
+                                    var keyMapping = { entityTypeName: entityType.name, tempValue: tempValue, realValue: realKey.values[0] };
+                                    keyMappings.push(keyMapping);
+                                }
+                            }
+                            entities.push(rawEntity);
+                        } else {
+                            var origEntity = contentKeys[contentId];
+                            entities.push(origEntity);
+                        }
+                    });
+                });
+                return deferred.resolve(saveResult);
+            }, function (err) {
+                return deferred.reject(createError(err, url));
+            }, odatajs.oData.batch.batchHandler, undefined, { sod: 'yo!' });
+
+            return deferred.promise;
+        } else {
+            //hack single request or no batch support
+            //maybe limit support to only one batch
+            var reqPromises = [];
+            //var entities = [];
+            var keyMappings = [];
+            
+            requestData.__batchRequests.forEach(function (breq) {
+                breq.__changeRequests.forEach(function (creq, index) {
+                    var deferred = Q.defer();
+
+                    odatajs.oData.request({
+                        headers: {
+                            "OData-Version": "4.0"
+                        },
+                        requestUri: creq.requestUri,
+                        method: creq.method,
+                        data: creq.data
+                    }, function (data, response) {
+
+                        //var response = cr.response || cr;
+                        var statusCode = response.statusCode;
+                        if ((!statusCode) || statusCode >= 400) {
+                            deferred.reject(createError(cr, url));
+                            return;
+                        }
+
+                        var contentId = index + 1;
+
+                        var rawEntity = data;
+                        if (rawEntity) {
+                            var tempKey = tempKeys[contentId];
+                            if (tempKey) {
+                                var entityType = tempKey.entityType;
+                                if (entityType.autoGeneratedKeyType !== AutoGeneratedKeyType.None) {
+                                    var tempValue = tempKey.values[0];
+                                    var realKey = entityType.getEntityKeyFromRawEntity(rawEntity, DataProperty.getRawValueFromServer);
+                                    var keyMapping = { entityTypeName: entityType.name, tempValue: tempValue, realValue: realKey.values[0] };
+                                    keyMappings.push(keyMapping);
+                                }
+                            }
+                            return deferred.resolve(rawEntity);
+                        } else {
+                            var origEntity = contentKeys[contentId];
+                            return deferred.resolve(origEntity);
+                        }                 
+                    }, function (err) {
+                        return deferred.reject(createError(err, url));
+                    });
+                    //check if handler required
+                    //}, odatajs.oData.batch.batchHandler, undefined, { sod: 'yo!' });
+
+                    reqPromises.push(deferred.promise);
                 });
             });
-            return deferred.resolve(saveResult);
-        }, function (err) {
-            return deferred.reject(createError(err, url));
-        }, odatajs.oData.batch.batchHandler, undefined, {sod: 'yo!'});
 
-        return deferred.promise;
-
+            return Q.all(reqPromises)
+                .then(function (entities) {
+                    var saveResult = { entities: entities, keyMappings: keyMappings };
+                    return saveResult;
+                });
+        }
     };
 
     proto.jsonResultsAdapter = new JsonResultsAdapter({
         name: "OData_default",
 
+        extractResults: function (data) {
+            //odata4 @odata.context minimal meta 
+            //set: http://localhost/[serviceName]/$metadata#[entityName]
+            //entity: http://localhost/[serviceName]/$metadata#[entityName]/$entity
+            
+            var context = data.result['@odata.context'];
+            if (core.stringEndsWith(context, "/$entity"))
+                return [data.result];
+            else
+                return data.result.value;
+        },
         visitNode: function (node, mappingContext, nodeContext) {
             var result = {};
             if (node == null) return result;
             var etag = node['@odata.etag'];
+            var odataContext = node['@odata.context'];
+
             if (etag != null) {
                 var entityTypeName;
                 if (nodeContext.nodeType === 'root') {
@@ -227,6 +348,26 @@
                     }
                 }
             }
+            else if (odataContext != null)
+            {
+                var entityTypeName;
+                if (nodeContext.nodeType === 'root') {
+                    //var re = new RegExp('^' + mappingContext.dataService.serviceName + '\\$metadata#(\\w+)/\\$entity$', 'i');
+                    var re = new RegExp('\\$metadata#(\\w+)/\\$entity$', 'i');
+                    var m = re.exec(odataContext);
+                    entityTypeName = mappingContext.entityManager.metadataStore.getEntityTypeNameForResourceName(m[1]);
+                }
+
+                var et = entityTypeName && mappingContext.entityManager.metadataStore.getEntityType(entityTypeName, true);
+
+                if (et) {
+                    result.entityType = et;
+                    result.extraMetadata = {
+                        //etag: etag
+                    }
+                }
+            }
+
             // OData v3 - projection arrays will be enclosed in a results array
             if (node.results) {
                 result.node = node.results;
@@ -339,8 +480,23 @@
         return uriKey;
     }
 
+
+
     function fmtProperty(prop, aspect) {
+        
+        if (prop.dataType.name == "Guid")
+            return aspect.getPropertyValue(prop.name);
+        //todo rest of type switches
         return prop.dataType.fmtOData(aspect.getPropertyValue(prop.name));
+    }
+
+    //hack odatav4 dont allow Type prefixes
+    breeze.DataType.Guid.fmtOData = function (val) {
+        if (val == null) return null;
+        if (!core.isGuid(val)) {
+            throwError("'%1' is not a valid guid", val);
+        }
+        return val;
     }
 
     function createError(error, url) {
