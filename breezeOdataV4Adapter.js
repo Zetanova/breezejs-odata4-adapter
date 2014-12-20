@@ -44,14 +44,7 @@
     proto.executeQuery = function (mappingContext) {
 
         var deferred = Q.defer();
-        var url = mappingContext.getUrl();
-
-        /**
-         *  The syntax for getting the count of a collection has changed with v4
-         *  http://docs.oasis-open.org/odata/odata/v4.0/errata01/os/complete/part2-url-conventions/odata-v4.0-errata01-os-part2-url-conventions-complete.html#_Toc395267183
-         */
-        url = url.replace('$inlinecount=allpages', '$count=true');
-        url = url.replace('$inlinecount=none', '$count=false');
+        var url = mappingContext.getUrl();       
 
         odatajs.oData.read({
                 requestUri: url,
@@ -618,3 +611,5 @@
 
 
 }));
+
+
