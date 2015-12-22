@@ -240,7 +240,8 @@
 
                     odatajs.oData.request({
                         headers: {
-                            "OData-Version": "4.0"
+                            'Content-Type': 'application/json;IEEE754Compatible=true',
+                            "OData-Version": "4.0"                            
                         },
                         requestUri: creq.requestUri,
                         method: creq.method,
@@ -400,7 +401,7 @@
         saveBundle.entities.forEach(function (entity, index) {
             var aspect = entity.entityAspect;
             id = id + 1; // we are deliberately skipping id=0 because Content-ID = 0 seems to be ignored.
-            var request = { headers: { "Content-ID": id, "OData-Version": "4.0" } };
+            var request = { headers: { "Content-ID": id, 'Content-Type': 'application/json;IEEE754Compatible=true', "OData-Version": "4.0" } };
             contentKeys[id] = entity;
             if (aspect.entityState.isAdded()) {
                 var resourceName = saveContext.resourceName || entity.entityType.defaultResourceName;
